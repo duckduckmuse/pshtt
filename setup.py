@@ -10,20 +10,28 @@ Based on:
 from setuptools import setup
 from pshtt import __version__
 
+
+def readme():
+    with open('README.md') as f:
+        return f.read()
+
+
 setup(
     name='pshtt',
 
     # Versions should comply with PEP440
     version=__version__,
     description='Scan websites for HTTPS deployment best practices',
+    long_description=readme(),
+    long_description_content_type='text/markdown',
 
     # NCATS "homepage"
-    url='https://www.dhs.gov/cyber-incident-response',
+    url='https://www.us-cert.gov/resources/ncats',
     # The project's main homepage
-    download_url='https://github.com/dhs-ncats/pshtt',
+    download_url='https://github.com/cisagov/pshtt',
 
     # Author details
-    author='Department of Homeland Security, National Cybersecurity Assessments and Technical Services team',
+    author='Cyber and Infrastructure Security Agency',
     author_email='ncats@hq.dhs.gov',
 
     license='License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication',
@@ -45,9 +53,8 @@ setup(
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate whether you support Python 2, Python 3 or both.
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.4',
-        'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7'
     ],
 
     # What does your project relate to?
@@ -57,21 +64,24 @@ setup(
 
     install_requires=[
         'requests>=2.18.4',
-        'sslyze>=1.4.1',
+        'sslyze>=2.0.0',
         'wget>=3.2',
-        'docopt',
-        'pytablereader',
-        'pytablewriter',
-        'publicsuffix',
-        'pyopenssl>=17.2.0'
+        'docopt>=0.6.2',
+        'pytablereader>=0.15.0',
+        'pytablewriter>=0.27.2',
+        'publicsuffix>=1.1.0',
+        'pyopenssl>=17.5.0',
+        'python-dateutil>=2.7.3',
+        'pytz>=2018.5',
     ],
 
     extras_require={
-        # 'dev': ['check-manifest'],
         'dev': [
-            'pytest',
-            'semver',
-            'tox',
+            'check-manifest>=0.36',
+            'pytest>=3.5.0',
+            'semver>=2.7.9',
+            'tox>=3.0.0',
+            'wheel>=0.31.0'
         ],
     },
 

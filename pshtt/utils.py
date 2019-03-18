@@ -37,7 +37,7 @@ def json_for(object):
 
 def write(content, destination, binary=False):
     parent = os.path.dirname(destination)
-    if parent is not "":
+    if parent != "":
         mkdir_p(parent)
 
     if binary:
@@ -90,7 +90,7 @@ def format_domains(domains):
 
     for domain in domains:
         # Replace a single instance of http://, https://, and www. if present.
-        formatted_domains.append(re.sub("^(https?://)?(www\.)?", "", domain))
+        formatted_domains.append(re.sub(r"^(https?://)?(www\.)?", "", domain))
 
     return formatted_domains
 
