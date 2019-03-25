@@ -159,40 +159,18 @@ def result_for(domain):
     # But also capture the extended data for those who want it.
     result['endpoints'] = domain.to_object()
 
-    # This bit is complicated because of the continue statements,
-    # perhaps overly so.  For instance, the continue statement
-    # following the "if header in ..." statement after "if not
-    # result['HTTPS Full Connection]" means that the final if
-    # statement that sets None values to False does not apply to those
-    # fields.  This code should be rewritten to more clear, or at
-    # least commented so that it is clearer what is happening to the
-    # various fields.  There is some implied logic due to the continue
-    # statements that is tricky, at least at first glance.
-    #
-    # Also, the comment before "for header in HEADERS" is not accurate
-    # for the same reason.
-    #
-    # - jsf9k
-
-    # Convert Header fields from None to False, except for:
-    # - "HSTS Header"
-    # - "HSTS Max Age"
-    # - "Redirect To"
+    # Convert Header fields from None to False, except for a bunch that should remain None to indicate an unknown status:
     for header in HEADERS:
-        if header in ("HSTS Header", "HSTS Max Age", "Redirect To"):
+        if header in ('HSTS Header', 'HSTS Max Age', 'Redirect To', 
+            'IP', 'Server Header', 'Server Version', 'HTTPS Cert Chain Length', 
+            'Valid HTTPS', 'HTTPS Publicly Trusted', 'HTTPS Custom Truststore Trusted',
+            'HTTPS Bad Chain', 'HTTPS Bad Hostname', 'HTTPS Expired Cert', 'HTTPS Self Signed Cert',
+            'HTTPS Probably Missing Intermediate Cert'):
             continue
 
         if not result['HTTPS Full Connection']:
-            if header in ('HSTS', 'HSTS Header', 'HSTS Max Age', 'HSTS Entire Domain', 'HSTS Preload Ready', 'Domain Uses Strong HSTS'):
+            if header in ('HSTS', 'HSTS Entire Domain', 'HSTS Preload Ready', 'Domain Uses Strong HSTS'):
                 continue
-
-        if header in ('IP', 'Server Header', 'Server Version', 'HTTPS Cert Chain Length') and result[header] is None:
-            continue
-
-        if header in ('Valid HTTPS', 'HTTPS Publicly Trusted', 'HTTPS Custom Truststore Trusted'):
-            if not result['HTTPS Live']:
-                result[header] = False
-            continue
 
         if result[header] is None:
             result[header] = False
@@ -644,6 +622,8 @@ def https_check(endpoint):
             custom_trust = None
         endpoint.https_public_trusted = public_trust
         endpoint.https_custom_trusted = custom_trust
+        if not public_trust and not custom_trust:
+            endpoint.https_valid = False
     except Exception as err:
         # Ignore exception
         utils.debug("{}: Unknown exception examining trust: {}".format(endpoint.url, err))
