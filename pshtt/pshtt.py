@@ -497,6 +497,9 @@ def hsts_check(endpoint):
     Disqualify domains with a bad host, they won't work as valid HSTS.
     """
     try:
+        if not endpoint.live or len(endpoint.headers) == 0:
+            return
+        
         if endpoint.https_bad_hostname:
             endpoint.hsts = False
             return
