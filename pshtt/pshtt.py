@@ -225,8 +225,9 @@ def ping(url, allow_redirects=False, verify=True):
         # set by --user_agent
         headers={'User-Agent': USER_AGENT},
 
-        # set by --timeout
-        timeout=TIMEOUT
+        # set by --timeout, connect timeout is timeout, 
+        # read timeout is 5 times longer for slow servers
+        timeout=(TIMEOUT,5*TIMEOUT)
     )
 
 
