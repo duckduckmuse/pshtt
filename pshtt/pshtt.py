@@ -168,8 +168,9 @@ def result_for(domain):
             'HTTPS Probably Missing Intermediate Cert'):
             continue
 
-        if not result['HTTPS Full Connection']:
+        if not result['HTTPS Full Connection'] or result['HSTS'] is None:
             if header in ('HSTS', 'HSTS Entire Domain', 'HSTS Preload Ready', 'Domain Uses Strong HSTS'):
+                result[header] = None
                 continue
 
         if result[header] is None:
