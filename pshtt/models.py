@@ -34,6 +34,7 @@ class Endpoint(object):
 
         # all HTTP/HTTPS endpoints have these
         self.headers = {}  # will be replaced with a requests.structures.CaseInsensitiveDict
+        self.ultimate_req_headers = None
         self.status = None
         self.live = None
         self.ip = None

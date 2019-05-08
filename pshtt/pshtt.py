@@ -473,6 +473,8 @@ def basic_check(endpoint):
                     (subdomain_original != subdomain_eventual)
                 )
 
+                endpoint.ultimate_req_headers = ultimate_req.headers
+
             # If we were able to make the first redirect, but not the ultimate redirect,
             # and if the immediate redirect is external, then it's accurate enough to
             # say that the eventual redirect is the immediate redirect, since you're capturing
@@ -508,6 +510,9 @@ def hsts_check(endpoint):
 
         header = endpoint.headers.get("Strict-Transport-Security")
 
+        if header is None and endpoint.ultimate_req_headers: 
+            header = endpoint.ultimate_req_headers.get("Strict-Transport-Security")
+            
         if header is None:
             endpoint.hsts = False
             return
