@@ -473,7 +473,10 @@ def basic_check(endpoint):
                     (subdomain_original != subdomain_eventual)
                 )
 
-                endpoint.ultimate_req_headers = ultimate_req.headers
+                # Store the headers from the redirected response to check for HSTS later only 
+                # if the redirect is on the same site as the original url
+                if endpoint.url in ultimate_req.url:
+                    endpoint.ultimate_req_headers = ultimate_req.headers
 
             # If we were able to make the first redirect, but not the ultimate redirect,
             # and if the immediate redirect is external, then it's accurate enough to
