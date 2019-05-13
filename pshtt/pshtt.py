@@ -473,10 +473,9 @@ def basic_check(endpoint):
                     (subdomain_original != subdomain_eventual)
                 )
 
-                # Store the headers from the redirected response to check for HSTS later only 
-                # if the redirect is on the same site as the original url
-                if endpoint.url in ultimate_req.url:
-                    endpoint.ultimate_req_headers = ultimate_req.headers
+                # Store the redirected response to check for HSTS later
+                endpoint.ultimate_req = ultimate_req
+                check_for_downgrades(endpoint, ultimate_req)
 
             # If we were able to make the first redirect, but not the ultimate redirect,
             # and if the immediate redirect is external, then it's accurate enough to
@@ -496,6 +495,34 @@ def basic_check(endpoint):
             utils.debug("{}: {}".format(endpoint.url, err))
 
 
+def check_for_downgrades(endpoint, ultimate_req):
+    try:
+        # Only check for https urls
+        #if not "https://" in endpoint.url:
+        #    return
+        downgrade = False
+        https = False
+        if "https://" in endpoint.url:
+            https = True
+        urls = []
+        if ultimate_req.history:
+            for entry in ultimate_req.history:
+                urls.append(entry.url)
+        if ultimate_req:
+            urls.append(ultimate_req.url)
+        for url in urls:
+            if https and "http://" in url:
+                downgrade = True
+                logging.warning("{}: Downgrade in redirect to {}.".format(endpoint.url, url))
+            if not https and "https://" in url:
+                https = True
+        if downgrade:
+            logging.warning("{}: Downgrade found in redirect chain {}.".format(endpoint.url, urls))
+    except Exception as err:
+        logging.warning("{}: Unexpected exception when checking for downgrades in redirects.".format(endpoint.url))
+        utils.debug("{}: {}".format(endpoint.url, err))
+
+
 def hsts_check(endpoint):
     """
     Given an endpoint and its detected headers, extract and parse
@@ -513,9 +540,14 @@ def hsts_check(endpoint):
 
         header = endpoint.headers.get("Strict-Transport-Security")
 
-        if header is None and endpoint.ultimate_req_headers: 
-            header = endpoint.ultimate_req_headers.get("Strict-Transport-Security")
-            
+        if header is None and endpoint.ultimate_req and endpoint.url in endpoint.ultimate_req.url: 
+            header = endpoint.ultimate_req.headers.get("Strict-Transport-Security")
+
+        if header is None and endpoint.ultimate_req and endpoint.ultimate_req.history:
+            for entry in endpoint.ultimate_req.history:
+                if header is None and endpoint.url in entry.url:
+                    header = entry.headers.get("Strict-Transport-Security")
+
         if header is None:
             endpoint.hsts = False
             return
