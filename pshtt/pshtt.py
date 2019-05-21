@@ -533,10 +533,6 @@ def hsts_check(endpoint):
     try:
         if not endpoint.live or len(endpoint.headers) == 0:
             return
-        
-        if endpoint.https_bad_hostname:
-            endpoint.hsts = False
-            return
 
         header = endpoint.headers.get("Strict-Transport-Security")
 
@@ -552,8 +548,13 @@ def hsts_check(endpoint):
             endpoint.hsts = False
             return
 
-        endpoint.hsts = True
         endpoint.hsts_header = header
+
+        if endpoint.https_bad_hostname:
+            endpoint.hsts = False
+            return
+            
+        endpoint.hsts = True
 
         # Set max age to the string after max-age
         # TODO: make this more resilient to pathological HSTS headers.
