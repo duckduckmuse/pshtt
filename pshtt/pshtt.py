@@ -14,6 +14,7 @@ import logging
 import sys
 import codecs
 import OpenSSL
+import threading
 
 try:
     from urllib import parse as urlparse  # Python 3
@@ -41,6 +42,15 @@ USER_AGENT = "pshtt, https scanning"
 
 # Defaults to 5 second, overrideable via --timeout
 TIMEOUT = 5
+
+# Synchronization lock between threads to ensure that only one thread runs the
+# initialization function, but that all threads wait for it to finish before
+# they continue
+init_lock = threading.RLock()
+
+# Global DNS resovers
+DNS_RESOLVER = None
+DNS_RESOLVERS_DEFAULT = ['8.8.8.8, 8.8.4.4, 1.1.1.1, 9.9.9.9']
 
 # The fields we're collecting, will be keys in JSON and
 # column headers in CSV.
@@ -177,6 +187,53 @@ def result_for(domain):
             result[header] = False
 
     return result
+
+
+from urllib3.util import connection
+import dns.resolver
+
+_orig_create_connection = connection.create_connection
+
+
+def patched_create_connection(address, *args, **kwargs):
+    """Wrap urllib3's create_connection to resolve the name elsewhere"""
+    host, port = address
+    answer = DNS_RESOLVER.query(host)
+    ip = answer.rrset[0].address
+    return _orig_create_connection((ip, port), *args, **kwargs)
+
+#from sslyze.server_connectivity_tester import ServerConnectivityTester _orig_do_dns_lookup = ServerConnectivityTester._do_dns_lookup
+
+
+def patched_do_dns_lookup(cls, hostname: str, port: int) -> str:
+    """Wrap sslyze's _do_dns_lookup to resolve the name using specified DNS"""
+    answer = DNS_RESOLVER.query(hostname)
+    ip = answer.rrset[0].address
+    return ip
+
+
+def initialize_dns_resolver(options=None):
+    """ Initializes a DNS resolver with the DNS nameservers from
+    the command-line argument or the default system ones
+    """
+    global DNS_RESOLVER, DNS_RESOLVERS_DEFAULT, TIMEOUT
+    # ensure that only one thread runs this init function, and have all threads wait until it finishes
+    init_lock.acquire()
+    if DNS_RESOLVER is not None:
+        init_lock.release()
+        return
+    DNS_RESOLVER = dns.resolver.Resolver()
+    DNS_RESOLVER.timeout = TIMEOUT
+    if options and options.get('dns'):
+        DNS_RESOLVER.nameservers = options['dns']
+        logging.debug('Initializing DNS resolver using passed in DNS nameservers: {}'.format(DNS_RESOLVER.nameservers))
+    if not DNS_RESOLVER.nameservers:
+        DNS_RESOLVER.nameservers = DNS_RESOLVERS_DEFAULT
+        logging.debug('Initializing DNS resolver using default DNS nameservers: {}'.format(DNS_RESOLVER.nameservers))
+    connection.create_connection = patched_create_connection
+    ServerConnectivityTester._do_dns_lookup = patched_do_dns_lookup
+    init_lock.release()
+    return
 
 
 def ping(url, allow_redirects=False, verify=True):
@@ -1627,7 +1684,7 @@ def initialize_external_data(
 
 def inspect_domains(domains, options):
     # Override timeout, user agent, preload cache, default CA bundle
-    global TIMEOUT, USER_AGENT, THIRD_PARTIES_CACHE, CA_FILE, PT_INT_CA_FILE, STORE
+    global TIMEOUT, USER_AGENT, THIRD_PARTIES_CACHE, CA_FILE, PT_INT_CA_FILE, STORE, DNS_RESOLVER
 
     if options.get('timeout'):
         TIMEOUT = int(options['timeout'])
@@ -1647,6 +1704,9 @@ def inspect_domains(domains, options):
 
     if options.get('pt_int_ca_file'):
         PT_INT_CA_FILE = options['pt_int_ca_file']
+
+    if not DNS_RESOLVER:
+        initialize_dns_resolver(options)
 
     # If this has been run once already by a Python API client, it
     # can be safely run without hitting the network or disk again,
