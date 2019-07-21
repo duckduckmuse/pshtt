@@ -383,6 +383,12 @@ def basic_check(endpoint):
         logging.warning("{}: Error connecting.".format(endpoint.url))
         utils.debug("{}: {}".format(endpoint.url, err))
 
+    except dns.exception.DNSException as err:
+        endpoint.live = False
+        logging.warning("{}: DNS exception performing web request.".format(endpoint.url))
+        utils.debug("{}: {}".format(endpoint.url, err))
+        return
+
     # And this is the parent of ConnectionError and other things.
     # For example, "too many redirects".
     # See https://github.com/kennethreitz/requests/blob/master/requests/exceptions.py
@@ -668,6 +674,12 @@ def https_check(endpoint):
         endpoint.live = False
         endpoint.https_valid = False
         logging.warning("{}: Error in sslyze server connectivity check when connecting to {}".format(endpoint.url, err.server_info.hostname))
+        utils.debug("{}: {}".format(endpoint.url, err))
+        return
+    except dns.exception.DNSException as err:
+        endpoint.live = False
+        endpoint.https_valid = False
+        logging.warning("{}: DNS exception in sslyze connectivity check.".format(endpoint.url))
         utils.debug("{}: {}".format(endpoint.url, err))
         return
     except Exception as err:
