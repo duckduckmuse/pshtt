@@ -648,6 +648,35 @@ def hsts_check(endpoint):
         utils.debug("{}: {}".format(endpoint.url, err))
         return
 
+from sslyze.server_connectivity_info import ServerConnectivityInfo
+from sslyze.utils.ssl_connection import SslConnection
+_orig_get_preconfigured_ssl_connection = ServerConnectivityInfo.get_preconfigured_ssl_connection
+
+def patched_get_preconfigured_ssl_connection(
+        self,
+        override_ssl_version = None,
+        ssl_verify_locations = None,
+        should_use_legacy_openssl = None,
+    ) -> SslConnection:
+	return _orig_get_preconfigured_ssl_connection(
+        self,
+        override_ssl_version,
+        ssl_verify_locations,
+        should_use_legacy_openssl = False
+    )
+
+
+# Perform one-time initialization
+def init(environment, options):
+    utils.debug("Initializing pshtt (patching sslyze legacy ssl client function)...")
+    ServerConnectivityInfo.get_preconfigured_ssl_connection = patched_get_preconfigured_ssl_connection
+
+
+# Perform one-time finalization
+def finalize(environment, options):
+    utils.debug("Finalizing pshtt (unpatching sslyze legacy ssl client function)...")
+    ServerConnectivityInfo.get_preconfigured_ssl_connection = _orig_get_preconfigured_ssl_connection
+
 
 def https_check(endpoint):
     """
@@ -848,7 +877,7 @@ def https_check(endpoint):
             ):
                 # *** TODO check that it is not a bad hostname and that the root cert is trusted before suggesting that it is an intermediate cert issue.
                 endpoint.https_missing_intermediate_cert = True
-                if(cert_plugin_result.successful_trust_store is None):
+                if(cert_plugin_result.verified_certificate_chain is None):
                     logging.warning("{}: Untrusted certificate chain, probably due to missing intermediate certificate.".format(endpoint.url))
                     utils.debug("{}: Only {} certificates in certificate chain received.".format(endpoint.url, endpoint.https_cert_chain_len))
                 elif(custom_trust is True and public_trust is False):
@@ -858,7 +887,7 @@ def https_check(endpoint):
                             cert_plugin_result = None
                             command = sslyze.plugins.certificate_info_plugin.CertificateInfoScanCommand(ca_file=PT_INT_CA_FILE)
                             cert_plugin_result = scanner.run_scan_command(server_info, command)
-                            if(cert_plugin_result.successful_trust_store is not None):
+                            if(cert_plugin_result.verified_certificate_chain is not None):
                                 public_trust = True
                                 endpoint.https_public_trusted = public_trust
                                 logging.warning("{}: Trusted by special public trust store with intermediate certificates.".format(endpoint.url))
