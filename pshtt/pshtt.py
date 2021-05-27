@@ -10,11 +10,17 @@ import re
 import base64
 import json
 import os
+import shutil
 import logging
 import sys
 import codecs
 import OpenSSL
 import threading
+import datetime
+
+from OpenSSL import crypto
+import certifi
+from OpenSSL.crypto import X509Store, X509StoreContext
 
 try:
     from urllib import parse as urlparse  # Python 3
@@ -42,6 +48,10 @@ USER_AGENT = "pshtt, https scanning"
 
 # Defaults to 5 second, overrideable via --timeout
 TIMEOUT = 5
+
+# Defaults to not scanning special ADFS URLs for HSTS headers
+# overrrideable via --scan-adfs
+SCAN_ADFS = False
 
 # Synchronization lock between threads to ensure that only one thread runs the
 # initialization function, but that all threads wait for it to finish before
@@ -91,12 +101,17 @@ STORE = "Mozilla"
 PT_INT_CA_FILE = None
 
 
-def inspect(base_domain):
+def inspect(base_domain, options=None):
     domain = Domain(base_domain)
     domain.http = Endpoint("http", "root", base_domain)
     domain.httpwww = Endpoint("http", "www", base_domain)
     domain.https = Endpoint("https", "root", base_domain)
     domain.httpswww = Endpoint("https", "www", base_domain)
+
+    # Load preload lists into the Domain object so we don't lose them to other slices
+    if options is not None:
+        domain.preload_list = options.get('preload_list', None)
+        domain.preload_pending = options.get('preload_pending', None)
 
     # Analyze HTTP endpoint responsiveness and behavior.
     basic_check(domain.http)
@@ -189,6 +204,45 @@ def result_for(domain):
     return result
 
 
+sock_requests = requests.packages.urllib3.contrib.pyopenssl.WrappedSocket
+
+
+def new_getpeercertchain(self, *args, **kwargs):
+    x509 = self.connection.get_peer_cert_chain()
+    return x509
+
+
+sock_requests.getpeercertchain = new_getpeercertchain
+
+HTTPResponse = requests.packages.urllib3.response.HTTPResponse
+orig_HTTPResponse__init__ = HTTPResponse.__init__
+
+
+def new_HTTPResponse__init__(self, *args, **kwargs):
+    orig_HTTPResponse__init__(self, *args, **kwargs)
+    try:
+        self.peercertchain = self._connection.sock.getpeercertchain()
+    except AttributeError:
+        pass
+
+
+HTTPResponse.__init__ = new_HTTPResponse__init__
+
+HTTPAdapter = requests.adapters.HTTPAdapter
+orig_HTTPAdapter_build_response = HTTPAdapter.build_response
+
+
+def new_HTTPAdapter_build_response(self, request, resp):
+    response = orig_HTTPAdapter_build_response(self, request, resp)
+    try:
+        response.peercertchain = resp.peercertchain
+    except AttributeError:
+        pass
+    return response
+
+
+HTTPAdapter.build_response = new_HTTPAdapter_build_response
+
 from urllib3.util import connection
 import dns.resolver
 
@@ -202,7 +256,7 @@ def patched_create_connection(address, *args, **kwargs):
     ip = answer.rrset[0].address
     return _orig_create_connection((ip, port), *args, **kwargs)
 
-#from sslyze.server_connectivity_tester import ServerConnectivityTester _orig_do_dns_lookup = ServerConnectivityTester._do_dns_lookup
+# from sslyze.server_connectivity_tester import ServerConnectivityTester _orig_do_dns_lookup = ServerConnectivityTester._do_dns_lookup
 
 
 def patched_do_dns_lookup(cls, hostname: str, port: int) -> str:
@@ -224,6 +278,7 @@ def initialize_dns_resolver(options=None):
         return
     DNS_RESOLVER = dns.resolver.Resolver()
     DNS_RESOLVER.timeout = TIMEOUT
+    DNS_RESOLVER.lifetime = TIMEOUT
     if options and options.get('dns'):
         DNS_RESOLVER.nameservers = options['dns']
         logging.debug('Initializing DNS resolver using passed in DNS nameservers: {}'.format(DNS_RESOLVER.nameservers))
@@ -259,8 +314,10 @@ def ping(url, allow_redirects=False, verify=True):
     values like multipart/x-mixed-replace;boundary=ffserver that
     indicate that the response body will stream indefinitely.
     """
+    global CA_FILE
     if CA_FILE and verify:
         verify = CA_FILE
+        # logging.debug("Using CA_FILE from {}".format(verify))
 
     return requests.get(
         url,
@@ -285,7 +342,7 @@ def ping(url, allow_redirects=False, verify=True):
 
         # set by --timeout, connect timeout is timeout, 
         # read timeout is 5 times longer for slow servers
-        timeout=(TIMEOUT,5*TIMEOUT)
+        timeout=(TIMEOUT, 5 * TIMEOUT)
     )
 
 
@@ -300,6 +357,7 @@ def basic_check(endpoint):
 
     * Validate certificates. (Will figure out error if necessary.)
     """
+    global SCAN_ADFS
 
     utils.debug("Pinging %s..." % endpoint.url, divider=True)
 
@@ -321,7 +379,7 @@ def basic_check(endpoint):
                 )
         ):
             logging.warning("{}: Error completing TLS handshake usually due to required client authentication.".format(endpoint.url))
-            utils.debug("{}: {}".format(endpoint.url, err))
+            utils.debug("  {}: {}".format(endpoint.url, err))
             endpoint.live = True
             if endpoint.protocol == "https":
                 # The https can still be valid with a handshake error,
@@ -331,7 +389,8 @@ def basic_check(endpoint):
 
         else:
             logging.warning("{}: Error connecting over SSL/TLS or validating certificate.".format(endpoint.url))
-            utils.debug("{}: {}".format(endpoint.url, err))
+            utils.debug("  {}: {}".format(endpoint.url, err))
+
             # Retry with certificate validation disabled.
             try:
                 with ping(endpoint.url, verify=False) as req:
@@ -349,23 +408,31 @@ def basic_check(endpoint):
                     # HTTPS may still be valid, sslyze will double-check later
                     endpoint.https_valid = True
                 logging.warning("{}: Unexpected SSL protocol (or other) error during retry.".format(endpoint.url))
-                utils.debug("{}: {}".format(endpoint.url, err))
+                utils.debug("  {}: {}".format(endpoint.url, err))
                 # continue on to SSLyze to check the connection
             except requests.exceptions.RequestException as err:
                 endpoint.live = False
                 logging.warning("{}: Unexpected requests exception during retry.".format(endpoint.url))
-                utils.debug("{}: {}".format(endpoint.url, err))
+                utils.debug("  {}: {}".format(endpoint.url, err))
                 return
             except OpenSSL.SSL.Error as err:
                 endpoint.live = False
                 logging.warning("{}: Unexpected OpenSSL exception during retry.".format(endpoint.url))
-                utils.debug("{}: {}".format(endpoint.url, err))
+                utils.debug("  {}: {}".format(endpoint.url, err))
                 return
             except Exception as err:
                 endpoint.unknown_error = True
                 logging.warning("{}: Unexpected other unknown exception during requests retry.".format(endpoint.url))
-                utils.debug("{}: {}".format(endpoint.url, err))
+                utils.debug("  {}: {}".format(endpoint.url, err))
                 return
+
+            # If HTTPS, examine certificate to see if there are intermediate certificates that can be trusted that are missing
+            if endpoint.protocol == "https" and req:
+                try:
+                    certchain = req.peercertchain
+                    checkCertChain(endpoint, certchain)
+                except Exception as err:
+                    logging.debug("{}: Error getting peercertchain to check for intermediate certs.".format(endpoint.url))
 
         # If it was a certificate error of any kind, it's live,
         # unless SSLyze encounters a connection error later
@@ -381,12 +448,12 @@ def basic_check(endpoint):
         else:
             endpoint.live = False
         logging.warning("{}: Error connecting.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
 
     except dns.exception.DNSException as err:
         endpoint.live = False
         logging.warning("{}: DNS exception performing web request.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
     # And this is the parent of ConnectionError and other things.
@@ -395,13 +462,13 @@ def basic_check(endpoint):
     except requests.exceptions.RequestException as err:
         endpoint.live = False
         logging.warning("{}: Unexpected other requests exception.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
     except Exception as err:
         endpoint.unknown_error = True
         logging.warning("{}: Unexpected other unknown exception during initial request.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
     # Run SSLyze to see if there are any errors
@@ -451,6 +518,7 @@ def basic_check(endpoint):
         endpoint.redirect = True
         logging.warning("{}: Found redirect.".format(endpoint.url))
 
+    ultimate_req = None
     if endpoint.redirect:
         try:
             location_header = req.headers.get('Location')
@@ -468,7 +536,7 @@ def basic_check(endpoint):
         except Exception as err:
             endpoint.unknown_error = True
             logging.warning("{}: Unexpected other unknown exception when handling Requests Header.".format(endpoint.url))
-            utils.debug("{} {}".format(endpoint.url, err))
+            utils.debug("  {} {}".format(endpoint.url, err))
 
         try:
             with ping(endpoint.url, allow_redirects=True, verify=False) as ultimate_req:
@@ -479,10 +547,12 @@ def basic_check(endpoint):
         except OpenSSL.SSL.Error:
             # Swallow connection errors, but we won't be saving redirect info.
             pass
+        except dns.exception.DNSException:
+            pass 
         except Exception as err:
             endpoint.unknown_error = True
             logging.warning("{}: Unexpected other unknown exception when handling redirect.".format(endpoint.url))
-            utils.debug("{}: {}".format(endpoint.url, err))
+            utils.debug("  {}: {}".format(endpoint.url, err))
             return
 
         try:
@@ -538,7 +608,6 @@ def basic_check(endpoint):
 
                 # Store the redirected response to check for HSTS later
                 endpoint.ultimate_req = ultimate_req
-                check_for_downgrades(endpoint, ultimate_req)
 
             # If we were able to make the first redirect, but not the ultimate redirect,
             # and if the immediate redirect is external, then it's accurate enough to
@@ -555,35 +624,85 @@ def basic_check(endpoint):
         except Exception as err:
             endpoint.unknown_error = True
             logging.warning("{}: Unexpected other unknown exception when establishing redirects.".format(endpoint.url))
-            utils.debug("{}: {}".format(endpoint.url, err))
+            utils.debug("  {}: {}".format(endpoint.url, err))
 
-
-def check_for_downgrades(endpoint, ultimate_req):
+    # if HTTPS and no HSTS check ADFS URL for HSTS (special case)
     try:
-        # Only check for https urls
-        #if not "https://" in endpoint.url:
-        #    return
+        if SCAN_ADFS and endpoint.protocol == "https" and not endpoint.https_bad_hostname:
+            hsts_check(endpoint)
+            if endpoint.hsts is not True:
+                try:
+                    utils.debug("{}: Trying ADFS URL for HSTS check at {}.".format(endpoint.url, endpoint.url + "/adfs/ls/"))
+                    with ping(endpoint.url + "/adfs/ls/", allow_redirects=False, verify=False) as adfs_req:
+                        pass
+                except requests.exceptions.RequestException:
+                    # Swallow connection errors
+                    pass
+                except OpenSSL.SSL.Error:
+                    # Swallow connection errors, but we won't be saving redirect info.
+                    pass
+                except Exception as err:
+                    logging.warning("{}: Unexpected other unknown exception when handling adfs test.".format(endpoint.url))
+                    utils.debug("  {}: {}".format(endpoint.url, err))
+
+                if adfs_req is not None:
+                    header = adfs_req.headers.get("Strict-Transport-Security")
+                    if header is None:
+                        utils.debug("{}: Found ADFS URL (status code {}), but no HSTS.".format(endpoint.url, adfs_req.status_code))
+                    else:
+                        if adfs_req.status_code == 200:
+                            endpoint.adfs_req = adfs_req
+                            utils.debug("{}: Found ADFS URL (status code {}) with HSTS '{}'.".format(endpoint.url, adfs_req.status_code, header))
+                        else:
+                            utils.debug("{}: Found ADFS URL, but not using since status is not 200 (status code {}) with HSTS '{}'.".format(endpoint.url, adfs_req.status_code, header))
+                else:
+                    utils.debug("{}: No response for ADFS URL.".format(endpoint.url))
+    except Exception as err:
+        logging.warning("{}: Unexpected other unknown exception when handling adfs test.".format(endpoint.url))
+        utils.debug("  {}: {}".format(endpoint.url, err))
+
+    check_redirect_chain(endpoint)
+
+
+def check_redirect_chain(endpoint):
+    try:
         downgrade = False
         https = False
         if "https://" in endpoint.url:
             https = True
-        urls = []
-        if ultimate_req.history:
-            for entry in ultimate_req.history:
-                urls.append(entry.url)
-        if ultimate_req:
-            urls.append(ultimate_req.url)
-        for url in urls:
-            if https and "http://" in url:
-                downgrade = True
-                logging.warning("{}: Downgrade in redirect to {}.".format(endpoint.url, url))
-            if not https and "https://" in url:
+        redirects = []
+        redirect_chain = []
+        if endpoint.ultimate_req is not None:
+            if endpoint.ultimate_req.history:
+                redirects.extend(endpoint.ultimate_req.history)
+            redirects.append(endpoint.ultimate_req)
+        else:
+            redirects.append(endpoint)
+        if endpoint.adfs_req:
+            redirects.append(endpoint.adfs_req)
+        for redirect_entry in redirects:
+            entry_downgrade = ""
+            entry_https = "HTTP"
+            entry_hsts = ""
+            if "https://" in redirect_entry.url:
                 https = True
+                entry_https = "HTTPS"
+                if "/adfs/" in redirect_entry.url:
+                    entry_https = "ADFS_HTTPS"
+                if redirect_entry.headers.get("Strict-Transport-Security"):
+                    entry_hsts = "+HSTS"
+            if https and "http://" in redirect_entry.url:
+                downgrade = True
+                entry_downgrade = "-Downgrade"
+                logging.warning("{}: Downgrade in redirect to {}.".format(endpoint.url, redirect_entry.url))
+            redirect_chain.append("{} ({}{}{})".format(redirect_entry.url, entry_https, entry_hsts, entry_downgrade))
         if downgrade:
-            logging.warning("{}: Downgrade found in redirect chain {}.".format(endpoint.url, urls))
+            logging.warning("{}: Downgrade found in redirect chain {}.".format(endpoint.url, redirect_chain))
+        endpoint.redirect_chain = redirect_chain
+        endpoint.notes = str(redirect_chain)
     except Exception as err:
         logging.warning("{}: Unexpected exception when checking for downgrades in redirects.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
 
 
 def hsts_check(endpoint):
@@ -599,13 +718,16 @@ def hsts_check(endpoint):
 
         header = endpoint.headers.get("Strict-Transport-Security")
 
-        if header is None and endpoint.ultimate_req and endpoint.url in endpoint.ultimate_req.url: 
+        if header is None and endpoint.ultimate_req and endpoint.url in endpoint.ultimate_req.url:
             header = endpoint.ultimate_req.headers.get("Strict-Transport-Security")
 
         if header is None and endpoint.ultimate_req and endpoint.ultimate_req.history:
             for entry in endpoint.ultimate_req.history:
                 if header is None and endpoint.url in entry.url:
                     header = entry.headers.get("Strict-Transport-Security")
+
+        if header is None and endpoint.adfs_req:
+            header = endpoint.adfs_req.headers.get("Strict-Transport-Security")
 
         if header is None:
             endpoint.hsts = False
@@ -645,7 +767,7 @@ def hsts_check(endpoint):
     except Exception as err:
         endpoint.unknown_error = True
         logging.warning("{}: Unknown exception when handling HSTS check.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
 from sslyze.server_connectivity_info import ServerConnectivityInfo
@@ -670,6 +792,8 @@ def patched_get_preconfigured_ssl_connection(
 def init(environment, options):
     utils.debug("Initializing pshtt (patching sslyze legacy ssl client function)...")
     ServerConnectivityInfo.get_preconfigured_ssl_connection = patched_get_preconfigured_ssl_connection
+    utils.debug("Initializing pshtt (running inspect_domains with no domains to initialize)...")
+    inspect_domains(None, options)
 
 
 # Perform one-time finalization
@@ -678,10 +802,11 @@ def finalize(environment, options):
     ServerConnectivityInfo.get_preconfigured_ssl_connection = _orig_get_preconfigured_ssl_connection
 
 
-def https_check(endpoint):
+def https_check(endpoint, check_for_intermediate_cert=True):
     """
     Uses sslyze to figure out the reason the endpoint wouldn't verify.
     """
+    global CA_FILE, PT_INT_CA_FILE, STORE
     utils.debug("sslyzing {}...".format(endpoint.url))
 
     # remove the https:// from prefix for sslyze
@@ -703,18 +828,18 @@ def https_check(endpoint):
         endpoint.live = False
         endpoint.https_valid = False
         logging.warning("{}: Error in sslyze server connectivity check when connecting to {}".format(endpoint.url, err.server_info.hostname))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
     except dns.exception.DNSException as err:
         endpoint.live = False
         endpoint.https_valid = False
         logging.warning("{}: DNS exception in sslyze connectivity check.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
     except Exception as err:
         endpoint.unknown_error = True
         logging.warning("{}: Unknown exception in sslyze server connectivity check.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
     try:
@@ -731,7 +856,7 @@ def https_check(endpoint):
             pass
         if(cert_plugin_result is None):
             logging.warning("{}: Unknown exception in sslyze scanner certificate plugin.".format(endpoint.url))
-            utils.debug("{}: {}".format(endpoint.url, err))
+            utils.debug("  {}: {}".format(endpoint.url, err))
             endpoint.unknown_error = True
             endpoint.https_valid = None  # could make this False, but there was an error so we don't know
             return
@@ -773,6 +898,26 @@ def https_check(endpoint):
                 logging.warning("{}: Not trusted by custom trust store.".format(endpoint.url))
         else:
             custom_trust = None
+
+        if check_for_intermediate_cert and not public_trust and not custom_trust:
+            # Try to see if there is a missing intermediate cert
+            try:
+                # Served chain.
+                served_chain = None
+                functions = dir(cert_plugin_result)
+                if "certificate_chain" in functions:
+                    served_chain = cert_plugin_result.certificate_chain
+                elif "received_certificate_chain" in functions:
+                    served_chain = cert_plugin_result.received_certificate_chain
+                else:
+                    raise Exception("Missing sslyze function to get certificate chain")
+                (valid, missingCert) = checkCertChain(endpoint, served_chain)
+                if valid:
+                    https_check(endpoint, False)
+                    return
+            except Exception as err:
+                utils.debug("{}: Error checking for missing intermediate cert in sslyze results: {}".format(endpoint.url, err))
+        
         endpoint.https_public_trusted = public_trust
         endpoint.https_custom_trusted = custom_trust
         if not public_trust and not custom_trust:
@@ -789,7 +934,7 @@ def https_check(endpoint):
     except Exception as err:
         endpoint.unknown_error = True
         logging.warning("{}: Unknown exception in cert plugin.".format(endpoint.url))
-        utils.debug("{}: {}".format(endpoint.url, err))
+        utils.debug("  {}: {}".format(endpoint.url, err))
         return
 
     # Debugging
@@ -867,7 +1012,7 @@ def https_check(endpoint):
             certificate_chain = cert_plugin_result.received_certificate_chain
         else:
             logging.warning("{}: Missing sslyze function to check for missing intermediate certificate.".format(endpoint.url))
-            utils.debug("{}: Missing sslyze certificate_chain or received_certificate_chain function".format(endpoint.url))
+            utils.debug("  {}: Missing sslyze certificate_chain or received_certificate_chain function".format(endpoint.url))
         if certificate_chain:
             endpoint.https_cert_chain_len = len(certificate_chain)
             if (
@@ -879,7 +1024,7 @@ def https_check(endpoint):
                 endpoint.https_missing_intermediate_cert = True
                 if(cert_plugin_result.verified_certificate_chain is None):
                     logging.warning("{}: Untrusted certificate chain, probably due to missing intermediate certificate.".format(endpoint.url))
-                    utils.debug("{}: Only {} certificates in certificate chain received.".format(endpoint.url, endpoint.https_cert_chain_len))
+                    utils.debug("  {}: Only {} certificates in certificate chain received.".format(endpoint.url, endpoint.https_cert_chain_len))
                 elif(custom_trust is True and public_trust is False):
                     # recheck public trust using custom public trust store with manually added intermediate certificates
                     if(PT_INT_CA_FILE is not None):
@@ -1021,6 +1166,255 @@ def canonical_endpoint(http, httpwww, https, httpswww):
     elif (not is_www) and (not is_https):
         return http
 
+
+def get_certificates(self):
+    from OpenSSL.crypto import _lib, _ffi, X509
+    """
+    https://github.com/pyca/pyopenssl/pull/367/files#r67300900
+
+    Returns all certificates for the PKCS7 structure, if present. Only
+    objects of type ``signedData`` or ``signedAndEnvelopedData`` can embed
+    certificates.
+
+    :return: The certificates in the PKCS7, or :const:`None` if
+        there are none.
+    :rtype: :class:`tuple` of :class:`X509` or :const:`None`
+    """
+
+    certs = _ffi.NULL
+    if self.type_is_signed():
+        certs = self._pkcs7.d.sign.cert
+    elif self.type_is_signedAndEnveloped():
+        certs = self._pkcs7.d.signed_and_enveloped.cert
+
+    pycerts = []
+    for i in range(_lib.sk_X509_num(certs)):
+        pycert = X509.__new__(X509)
+        pycert._x509 = _lib.sk_X509_value(certs, i)
+        pycerts.append(pycert)
+
+    if not pycerts:
+        return None
+    return tuple(pycerts)
+
+
+def extract_certs(certs_txt: str):
+    """Extracts pycrypto X509 objects from SSL certificates chain string.
+
+    Args:
+        certs_txt: SSL certificates chain string.
+
+    Returns:
+        result: List of pycrypto X509 objects.
+    """
+    pattern = b'-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----'
+    certs_txt = re.findall(pattern, certs_txt, flags=re.DOTALL)
+    certs = [crypto.load_certificate(crypto.FILETYPE_PEM, cert_txt) for cert_txt in certs_txt]
+    return certs
+
+
+def findIntermediateCertURLsInCert(cert):
+    urls = []
+    logging.debug("Examining cert - Subject '{}', Issuer '{}', NotBefore '{}', NotAfter '{}'".format(cert.get_subject(), cert.get_issuer(), cert.get_notBefore(), cert.get_notAfter()))
+    extension_count = cert.get_extension_count()
+    for ext_number in range(extension_count):
+        if cert.get_extension(ext_number).get_short_name() == b'authorityInfoAccess':
+            aia = cert.get_extension(ext_number).get_data()
+            logging.debug("Found AIA info: {}".format(aia))
+            pieces = str(aia).split('\\x')
+            for piece in pieces:
+                # pattern = "http:[a-zA-Z0-9_./\-]+(.crt|.cer|.pem|.p7b|.p7c)"
+                pattern = '(https?:\S+(\.crt|\.cer|\.pem|\.p7b|\.p7c))'
+                matches = re.findall(pattern, piece)
+                # print("Possible matches: {}".format(matches))
+                for m1 in matches:
+                    for m2 in m1:
+                        if m2.startswith("http"):
+                            # probably what we're looking for
+                            logging.debug("Found probable intermediate cert at: {}".format(m2))
+                            int_url = m2
+                            urls.append(int_url)
+    return urls
+
+
+def downloadCerts(endpoint, url, filename, extension):
+    certs_to_return = []
+    logging.debug("{}: Downloading cert from url: {}".format(endpoint.url, url))
+    try:
+        r = requests.get(url, verify=False)
+    except Exception as err:
+        logging.debug("{}: Error downloading certs from {}: {}".format(endpoint.url, url, err))
+        return None
+    if(extension == "p7b"):
+        cert_data = crypto.load_pkcs7_data(crypto.FILETYPE_PEM, r.content)
+        certs = get_certificates(cert_data)
+    elif(extension == "p7c"):
+        cert_data = crypto.load_pkcs7_data(crypto.FILETYPE_ASN1, r.content)
+        certs = get_certificates(cert_data)
+    else:
+        cert_data = crypto.load_certificate(crypto.FILETYPE_ASN1, r.content)
+        certs = [cert_data]
+    logging.debug("{}: Found {} certs in downloaded cert file.".format(endpoint.url, len(certs)))
+    for cert in certs:
+        pem_cert = crypto.dump_certificate(crypto.FILETYPE_PEM, cert)
+        new_cert = crypto.load_certificate(crypto.FILETYPE_PEM, pem_cert)
+        certs_to_return.append(new_cert)
+    return certs_to_return
+
+
+def addPublicCAsToStore(endpoint, store, filename):
+    # if CA_FILE then use it, otherwise use PT_INT_CA_FILE, otherwise use certifi
+    logging.debug("{}: Adding publicly trusted CA certs to trust store to test from: {}".format(endpoint.url, filename))
+    with open(filename, 'rb') as certs_file:
+        ca_certs = extract_certs(certs_file.read())
+        for ca_cert in ca_certs:
+            store.add_cert(ca_cert)
+        logging.debug("{}: Added {} Public CA certs.".format(endpoint.url, len(ca_certs)))
+    return ca_certs
+
+
+def findIntCertURLsInSSLyzeCert(cert):
+    urls = []
+    print("Examining cert - Subject '{}', Issuer '{}', NotBefore '{}', NotAfter '{}'".format(cert.subject, cert.issuer, cert.not_valid_before, cert.not_valid_after))
+    for extension in cert.extensions:
+        if extension.oid._name == 'authorityInfoAccess':
+            aias = extension.value
+            print("Found AIA info: {}".format(aias))
+            for aia in aias:
+                url = aia.access_location.value
+                pattern = '(https?:\S+(\.crt|\.cer|\.pem|\.p7b|\.p7c))'
+                matches = re.findall(pattern, url)
+                # print("Possible matches: {}".format(matches))
+                for m1 in matches:
+                    for m2 in m1:
+                        if m2.startswith("http"):
+                            # probably what we're looking for
+                            print("Found probable intermediate cert at: {}".format(m2))
+                            int_url = m2
+                            urls.append(int_url)
+    return urls
+
+
+def findIntCertURLsInCert(endpoint, cert):
+    if str(type(cert)) == "<class 'cryptography.hazmat.backends.openssl.x509._Certificate'>":
+        return findIntCertURLsInSSLyzeCert(cert)
+    urls = []
+    logging.debug("{}: Examining cert - Subject '{}', Issuer '{}', NotBefore '{}', NotAfter '{}'".format(endpoint.url, cert.get_subject(), cert.get_issuer(), cert.get_notBefore(), cert.get_notAfter()))
+    extension_count = cert.get_extension_count()
+    for ext_number in range(extension_count):
+        if cert.get_extension(ext_number).get_short_name() == b'authorityInfoAccess':
+            aia = cert.get_extension(ext_number).get_data()
+            logging.debug("{}: Found AIA info: {}".format(endpoint.url, aia))
+            pieces = str(aia).split('\\x')
+            for piece in pieces:
+                pattern = '(https?:\S+(\.crt|\.cer|\.pem|\.p7b|\.p7c))'
+                matches = re.findall(pattern, piece)
+                for m1 in matches:
+                    for m2 in m1:
+                        if m2.startswith("http"):
+                            # probably what we're looking for
+                            logging.debug("{}: Found probable intermediate cert at: {}".format(endpoint.url, m2))
+                            int_url = m2
+                            urls.append(int_url)
+    return urls
+
+
+def checkIfCertAlreadyTrusted(endpoint, cert, ca_certs):
+    for ca_cert in ca_certs:
+        if(ca_cert.get_subject() == cert.get_subject() and ca_cert.digest("SHA256") == cert.digest("SHA256")):
+            logging.debug("{}: Certificate already trusted: {}".format(endpoint.url, cert.get_subject()))
+            return True
+    return False
+
+
+def checkIfCertIsTrusted(endpoint, cert, store):
+    try:
+        store_ctx = X509StoreContext(store, cert)
+        store_ctx.verify_certificate()
+        logging.debug("{}: New intermediate cert verified: {}".format(endpoint.url, cert.get_subject()))
+        return True
+    except Exception as err:
+        try:
+            logging.debug("{}: Possible new intermediate cert not able to be verified: {}.".format(endpoint.url, cert.get_subject()))
+        except Exception:
+            logging.debug("{}: Possible new intermediate cert not able to be verified.".format(endpoint.url))
+    return False
+
+
+def checkCertChain(endpoint, certchain):
+    global CA_FILE, PT_INT_CA_FILE, STORE
+    valid = None
+    missingCert = None
+    try: 
+        logging.debug("Looking for intermediate certs from: {}".format(endpoint.url))
+        int_cert_urls = []
+        for cert in certchain:
+            cert_urls = findIntCertURLsInCert(endpoint, cert)
+            for new_cert_url in cert_urls:
+                if new_cert_url not in int_cert_urls:
+                    int_cert_urls.append(new_cert_url)
+        certs_to_add_to_all_file = []
+        certs_to_add_to_pt_file = []
+        all_file = None
+        pt_file = None
+        if CA_FILE:
+            all_file = CA_FILE
+            pt_file = CA_FILE
+        if PT_INT_CA_FILE:
+            pt_file = PT_INT_CA_FILE
+        if all_file is None:
+            all_file = certifi.where()
+        if pt_file is None:
+            pt_file = certifi.where()
+        for int_cert_url in int_cert_urls:
+            try:
+                filename = str(int_cert_url).rsplit('/', 1)[1].strip("'").replace("%20", "_")
+                logging.debug("{}: New possible intermediate cert filename is: {}".format(endpoint.url, filename))
+                parts = filename.split('.')
+                extension = parts[(len(parts) - 1)].lower()
+                certs = downloadCerts(endpoint, int_cert_url, filename, extension)
+
+                store = X509Store()
+                ca_certs = addPublicCAsToStore(endpoint, store, all_file)
+                for cert in certs:
+                    if not checkIfCertAlreadyTrusted(endpoint, cert, ca_certs):
+                        if checkIfCertIsTrusted(endpoint, cert, store):
+                            certs_to_add_to_all_file.append(cert)
+                store = X509Store()
+                ca_certs = addPublicCAsToStore(endpoint, store, pt_file)
+                for cert in certs:
+                    if not checkIfCertAlreadyTrusted(endpoint, cert, ca_certs):
+                        if checkIfCertIsTrusted(endpoint, cert, store):
+                            certs_to_add_to_pt_file.append(cert)                   
+            except Exception as err:
+                logging.debug("{}: Error checking a possible intermediate cert url: {}".format(endpoint.url, err))
+        for (cert_type, certs_to_add, certs_filename) in [("ALL", certs_to_add_to_all_file, all_file), ("PT", certs_to_add_to_pt_file, pt_file)]:        
+            if certs_to_add and len(certs_to_add) > 0:
+                # Add validated trusted intermediate cert to trust store to use
+                new_certs_filename = "pshtt_" + certs_filename.rsplit('/', 1)[1]
+                if os.path.exists("./cache/"):
+                    new_certs_filename = "./cache/" + new_certs_filename
+                else:
+                    new_certs_filename = "./tmp/" + new_certs_filename
+                if new_certs_filename != certs_filename:
+                    shutil.copyfile(certs_filename, new_certs_filename)
+                with open(new_certs_filename, 'ab') as new_certs_file:
+                    for cert_to_add in certs_to_add:
+                        logging.debug("{}: Adding to trust store at {} cert: {}".format(endpoint.url, new_certs_filename, cert_to_add.get_subject()))
+                        certPEM = crypto.dump_certificate(crypto.FILETYPE_PEM, cert_to_add)
+                        new_certs_file.write(certPEM)
+                # Update trust stores to use going forward
+                if cert_type == "ALL":
+                    CA_FILE = new_certs_filename
+                if cert_type == "PT":
+                    PT_INT_CA_FILE = new_certs_filename
+                STORE = "Custom"
+                valid = True
+                missingCert = True
+            logging.debug("{}: Finished adding {} certs to {} trust store.".format(endpoint.url, len(certs_to_add), cert_type))
+    except Exception as err:
+        logging.debug("{}: Error checking cert chain for missing intermediate certs: {}".format(endpoint.url, err))
+    return (valid, missingCert)
 
 ##
 # Judgment calls based on observed endpoint data.
@@ -1337,15 +1731,35 @@ def is_missing_intermediate_cert(domain):
 
 def is_hsts(domain):
     """
-    Domain has HSTS if its canonical HTTPS endpoint has HSTS.
+    Domain has HSTS if both https and httpswww endpoints have HSTS when live.
     """
-    canonical, https, httpswww = domain.canonical, domain.https, domain.httpswww
+    https, httpswww = domain.https, domain.httpswww
 
-    if canonical.host == "www":
+    if not https.live and not httpswww.live:
+        return None
+
+    utils.debug("{}: Testing HSTS - https.hsts is '{}', httpswww.hsts is '{}'.".format(domain.domain, https.hsts, httpswww.hsts))
+
+    hsts = None
+    if https.live and (https.hsts is not None):
+        hsts = https.hsts
+    if httpswww.live and (httpswww.hsts is not None):
+        if hsts is None:
+            hsts = httpswww.hsts
+        else:
+            hsts &= httpswww.hsts
+
+    if domain.canonical.host == "www":
         canonical_https = httpswww
     else:
         canonical_https = https
 
+    old_hsts = canonical_https.hsts
+    if old_hsts != hsts:
+        utils.debug("{}: Difference in HSTS - old {} != new (for both https endpoints) {}.".format(domain.domain, old_hsts, hsts))
+
+    # should be the following, but that is stricter than currently
+    # return hsts
     return canonical_https.hsts
 
 
@@ -1413,6 +1827,9 @@ def is_hsts_preload_pending(domain):
             'using this function'
         )
 
+    if domain.preload_pending is not None and domain.domain in domain.preload_pending:
+        return True
+
     return domain.domain in preload_pending
 
 
@@ -1429,14 +1846,24 @@ def is_hsts_preloaded(domain):
             'using this function'
         )
 
-    return domain.domain in preload_list
+    result = None
+    if domain.preload_list is not None and domain.domain in domain.preload_list:
+        result = True
+        logging.debug("Checked if {} is in domain's preload list: {}".format(domain.domain, result))
+
+    if not result:
+        result = domain.domain in preload_list
+        logging.debug("Checking if {} is in preload list: {}".format(domain.domain, result))
+    return result
 
 
 def is_parent_hsts_preloaded(domain):
     """
     Whether a domain's parent domain is in Chrome's HSTS preload list.
     """
-    return is_hsts_preloaded(Domain(parent_domain_for(domain.domain)))
+    parent_domain = Domain(parent_domain_for(domain.domain))
+    parent_domain.preload_list = domain.preload_list
+    return is_hsts_preloaded(parent_domain)
 
 
 def parent_domain_for(hostname):
@@ -1451,8 +1878,9 @@ def parent_domain_for(hostname):
             '`initialize_external_data()` must be called explicitly before '
             'using this function'
         )
-
-    return suffix_list.get_public_suffix(hostname)
+    result = suffix_list.get_public_suffix(hostname)
+    logging.debug("Getting parent domain of {}: {}".format(hostname, result))
+    return result
 
 
 def is_domain_supports_https(domain):
@@ -1549,7 +1977,7 @@ def get_domain_notes(domain):
     """
     Combine all domain notes if there are any.
     """
-    all_notes = domain.http.notes + domain.httpwww.notes + domain.https.notes + domain.httpswww.notes
+    all_notes = domain.http.notes + "; " + domain.httpwww.notes + "; " + domain.https.notes + "; " + domain.httpswww.notes
     all_notes = all_notes.replace(',', ';')
     return all_notes
 
@@ -1596,6 +2024,8 @@ def load_preload_pending():
         if entry.get('include_subdomains', False) is True:
             pending.append(entry['name'])
 
+    logging.debug('Finished loading pending preload list.')
+
     return pending
 
 
@@ -1611,7 +2041,7 @@ def load_preload_list():
         request = requests.get(file_url)
     except (requests.exceptions.SSLError, requests.exceptions.ConnectionError) as err:
         logging.warning('Failed to fetch preload list: {}'.format(file_url))
-        logging.debug('{}'.format(err))
+        logging.debug('  {}'.format(err))
         return []
 
     raw = request.content
@@ -1635,6 +2065,8 @@ def load_preload_list():
         if entry.get('include_subdomains', False) is True:
             fully_preloaded.append(entry['name'])
 
+    logging.debug('Finished loading preload list.')
+
     return fully_preloaded
 
 
@@ -1647,7 +2079,7 @@ def load_suffix_list():
         cache_file = fetch()
     except URLError as err:
         logging.warning("Unable to download the Public Suffix List...")
-        utils.debug("{}".format(err))
+        utils.debug("  {}".format(err))
         return []
     content = cache_file.readlines()
     suffixes = PublicSuffixList(content)
@@ -1698,6 +2130,7 @@ def initialize_external_data(
     # If there's a specified cache dir, prepare paths.
     # Only used when no data has been set yet for a source.
     if THIRD_PARTIES_CACHE:
+        logging.debug('Third parties cache flag is set.')
         cache_preload_list = os.path.join(THIRD_PARTIES_CACHE, cache_preload_list_default)
         cache_preload_pending = os.path.join(THIRD_PARTIES_CACHE, cache_preload_pending_default)
         cache_suffix_list = os.path.join(THIRD_PARTIES_CACHE, cache_suffix_list_default)
@@ -1744,28 +2177,31 @@ def initialize_external_data(
 
 def inspect_domains(domains, options):
     # Override timeout, user agent, preload cache, default CA bundle
-    global TIMEOUT, USER_AGENT, THIRD_PARTIES_CACHE, CA_FILE, PT_INT_CA_FILE, STORE, DNS_RESOLVER
+    global TIMEOUT, USER_AGENT, THIRD_PARTIES_CACHE, CA_FILE, PT_INT_CA_FILE, STORE, DNS_RESOLVER, SCAN_ADFS
 
     if options.get('timeout'):
         TIMEOUT = int(options['timeout'])
     if options.get('user_agent'):
         USER_AGENT = options['user_agent']
+    if options.get('adfs_hsts'):
+        SCAN_ADFS = options['adfs_hsts']
 
     # Supported cache flag, a directory to store all third party requests.
     if options.get('cache-third-parties'):
+        logging.debug("cache-third-parties is set.")
         THIRD_PARTIES_CACHE = options['cache-third-parties']
 
-    if options.get('ca_file'):
+    if CA_FILE is None and options.get('ca_file'):
         CA_FILE = options['ca_file']
         # By default, the store that we want to check is the Mozilla store
         # However, if a user wants to use their own CA bundle, check the
         # "Custom" Option from the sslyze output.
         STORE = "Custom"
 
-    if options.get('pt_int_ca_file'):
+    if PT_INT_CA_FILE is None and options.get('pt_int_ca_file'):
         PT_INT_CA_FILE = options['pt_int_ca_file']
 
-    if not DNS_RESOLVER:
+    if DNS_RESOLVER is None:
         initialize_dns_resolver(options)
 
     # If this has been run once already by a Python API client, it
@@ -1774,5 +2210,6 @@ def inspect_domains(domains, options):
     initialize_external_data()
 
     # For every given domain, get inspect data.
-    for domain in domains:
-        yield inspect(domain)
+    if domains:
+        for domain in domains:
+            yield inspect(domain, options)

@@ -14,6 +14,10 @@ class Domain(object):
         # Filled in after analyzing each endpoint.
         self.canonical = None
 
+        # The slices that apply to this domain
+        self.preload_list = None
+        self.preload_pending = None
+
     def to_object(self):
         return {
             'https': self.https.to_object(),
@@ -35,6 +39,7 @@ class Endpoint(object):
         # all HTTP/HTTPS endpoints have these
         self.headers = {}  # will be replaced with a requests.structures.CaseInsensitiveDict
         self.ultimate_req = None
+        self.adfs_req = None
         self.status = None
         self.live = None
         self.ip = None
@@ -71,6 +76,7 @@ class Endpoint(object):
         self.https_self_signed_cert = None
         self.https_cert_chain_len = None
         self.https_missing_intermediate_cert = None
+        self.server_certificate_issuer = None
         self.hsts = None
         self.hsts_header = None
         self.hsts_max_age = None
@@ -124,6 +130,7 @@ class Endpoint(object):
             obj['https_self_signed_cert'] = self.https_self_signed_cert
             obj['https_cert_chain_len'] = self.https_cert_chain_len
             obj['https_missing_intermediate_cert'] = self.https_missing_intermediate_cert
+            obj['https_server_certificate_issuer'] = self.server_certificate_issuer
             obj['hsts'] = self.hsts
             obj['hsts_header'] = self.hsts_header
             obj['hsts_max_age'] = self.hsts_max_age
