@@ -100,6 +100,12 @@ CA_FILE = None
 STORE = "Mozilla"
 PT_INT_CA_FILE = None
 
+# Flag for whether to save names in certificates to a file to gather data for other efforts
+SAVE_CERT_NAMES = False
+CERT_NAMES_FILENAME = "./cache/cert_names.csv"
+
+# Variable to cache DNS responses
+DNS_CACHE = {}
 
 def inspect(base_domain, options=None):
     domain = Domain(base_domain)
@@ -246,22 +252,42 @@ HTTPAdapter.build_response = new_HTTPAdapter_build_response
 from urllib3.util import connection
 import dns.resolver
 
+
+def do_dns_lookup(hostname):
+    answer = None
+    if hostname in DNS_CACHE:
+        # logging.debug('{}: Getting from DNS cache {}'.format(hostname, hostname))
+        answer = DNS_CACHE[hostname]
+        if isinstance(answer, Exception):
+            # logging.debug('{}: Found exception in DNS cache {}'.format(hostname, hostname))
+            raise answer
+    else:
+        try:
+            answer = DNS_RESOLVER.query(hostname)
+            DNS_CACHE[hostname] = answer
+        except Exception as ex:
+            DNS_CACHE[hostname] = ex
+            raise ex
+    return answer
+
+
 _orig_create_connection = connection.create_connection
 
 
 def patched_create_connection(address, *args, **kwargs):
     """Wrap urllib3's create_connection to resolve the name elsewhere"""
     host, port = address
-    answer = DNS_RESOLVER.query(host)
+    answer = do_dns_lookup(host)
     ip = answer.rrset[0].address
     return _orig_create_connection((ip, port), *args, **kwargs)
+
 
 # from sslyze.server_connectivity_tester import ServerConnectivityTester _orig_do_dns_lookup = ServerConnectivityTester._do_dns_lookup
 
 
 def patched_do_dns_lookup(cls, hostname: str, port: int) -> str:
     """Wrap sslyze's _do_dns_lookup to resolve the name using specified DNS"""
-    answer = DNS_RESOLVER.query(hostname)
+    answer = do_dns_lookup(hostname)
     ip = answer.rrset[0].address
     return ip
 
@@ -541,14 +567,17 @@ def basic_check(endpoint):
         try:
             with ping(endpoint.url, allow_redirects=True, verify=False) as ultimate_req:
                 pass
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as err:
             # Swallow connection errors, but we won't be saving redirect info.
+            logging.debug("{}: Unexpected exception when trying to follow redirect. {}.".format(endpoint.url, err))
             pass
-        except OpenSSL.SSL.Error:
+        except OpenSSL.SSL.Error as err:
             # Swallow connection errors, but we won't be saving redirect info.
+            logging.debug("{}: Unexpected exception when trying to follow redirect. {}.".format(endpoint.url, err))
             pass
-        except dns.exception.DNSException:
-            pass 
+        except dns.exception.DNSException as err:
+            logging.debug("{}: Unexpected exception when trying to follow redirect. {}.".format(endpoint.url, err))
+            pass
         except Exception as err:
             endpoint.unknown_error = True
             logging.warning("{}: Unexpected other unknown exception when handling redirect.".format(endpoint.url))
@@ -792,6 +821,12 @@ def patched_get_preconfigured_ssl_connection(
 def init(environment, options):
     utils.debug("Initializing pshtt (patching sslyze legacy ssl client function)...")
     ServerConnectivityInfo.get_preconfigured_ssl_connection = patched_get_preconfigured_ssl_connection
+
+    if SAVE_CERT_NAMES:
+        utils.debug("Initializing cert names file...")
+        with open(CERT_NAMES_FILENAME, 'w+') as cert_names_file:
+            cert_names_file.write("URL,Name\r\n")
+
     utils.debug("Initializing pshtt (running inspect_domains with no domains to initialize)...")
     inspect_domains(None, options)
 
@@ -918,6 +953,21 @@ def https_check(endpoint, check_for_intermediate_cert=True):
             except Exception as err:
                 utils.debug("{}: Error checking for missing intermediate cert in sslyze results: {}".format(endpoint.url, err))
         
+        # Check for names in certificate
+        try:
+            # Served chain.
+            served_chain = None
+            functions = dir(cert_plugin_result)
+            if "certificate_chain" in functions:
+                served_chain = cert_plugin_result.certificate_chain
+            elif "received_certificate_chain" in functions:
+                served_chain = cert_plugin_result.received_certificate_chain
+            else:
+                raise Exception("Missing sslyze function to get certificate chain")
+            findNamesInCertChain(endpoint, served_chain)
+        except Exception as err:
+            utils.debug("{}: Error checking for names in server certificate: {}".format(endpoint.url, err))
+
         endpoint.https_public_trusted = public_trust
         endpoint.https_custom_trusted = custom_trust
         if not public_trust and not custom_trust:
@@ -1339,6 +1389,65 @@ def checkIfCertIsTrusted(endpoint, cert, store):
         except Exception:
             logging.debug("{}: Possible new intermediate cert not able to be verified.".format(endpoint.url))
     return False
+
+
+def findCN(names, subject):
+    pattern = "CN=([^,\)]+)"
+    matches = re.findall(pattern, str(subject))
+    for m1 in matches:
+        # logging.debug("  Found probable CN at: {}".format(m1))
+        if m1 not in names:
+            names.append(m1)
+    return names
+
+
+def findSAN(names, san):
+    pattern = "value='(\S+)'"
+    matches = re.findall(pattern, str(san))
+    for m1 in matches:
+        # logging.debug("  Found probable SAN at: {}".format(m1))
+        if m1 not in names:
+            names.append(m1)
+    return names
+
+
+def findNamesInSSLyzeCert(endpoint, cert):
+    names = []
+    print("sslyze Server cert subject: {}".format(cert.subject))
+    names = findCN(names, cert.subject)
+    for extension in cert.extensions:
+        if extension.oid._name == 'subjectAltName':
+            san = extension.value
+            logging.debug("{}: Found SAN info: {}".format(endpoint.url, san))
+            names = findSAN(names, san)
+    return names
+
+
+def findNamesInCert(endpoint, cert):
+    if str(type(cert)) == "<class 'cryptography.hazmat.backends.openssl.x509._Certificate'>":
+        return findNamesInSSLyzeCert(endpoint, cert)
+    names = []
+    logging.debug("{}: Server cert subject: {}".format(endpoint.url, cert.get_subject()))
+    names = findCN(names, cert.get_subject())
+    extension_count = cert.get_extension_count()
+    for ext_number in range(extension_count):
+        if cert.get_extension(ext_number).get_short_name() == b'subjectAltName':
+            san = cert.get_extension(ext_number).get_data()
+            logging.debug("{}: Found SAN info: {}".format(endpoint.url, san))
+            names = findSAN(names, san)
+    return names
+
+
+def findNamesInCertChain(endpoint, certchain):
+    try:
+        # logging.debug("{}: Looking for names in cert chain...".format(endpoint.url))
+        if SAVE_CERT_NAMES and certchain:
+            names = findNamesInCert(endpoint, certchain[0])
+            with open(CERT_NAMES_FILENAME, 'a+') as cert_names_file:
+                for name in names:
+                    cert_names_file.write("{},{}\r\n".format(endpoint.url, name))
+    except Exception as err:
+        logging.debug("{}: Error looking for cert names: {}".format(endpoint.url, err))
 
 
 def checkCertChain(endpoint, certchain):
